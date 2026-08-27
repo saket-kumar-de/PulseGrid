@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+*.egg-info/
+
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+
+data/raw/
+data/curated/
