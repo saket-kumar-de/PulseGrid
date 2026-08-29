@@ -35,3 +35,15 @@ resource "aws_s3_bucket_versioning" "curated" {
     status = "Enabled"
   }
 }
+
+# Glue assets: For Glue scripts and spark's temp / shuffle files
+resource "aws_s3_bucket" "glue_assets" {
+  bucket        = "${var.project_name}-${var.environment}-glue-assets"
+  force_destroy = true
+
+  tags = {
+    Environment = var.environment
+    Layer       = "assets"
+    Project     = var.project_name
+  }
+}
