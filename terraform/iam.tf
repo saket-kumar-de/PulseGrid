@@ -29,10 +29,9 @@ resource "aws_iam_role_policy" "glue_s3_access" {
       Effect   = "Allow"
       Action   = ["s3:GetObject", "s3:PutObject", "s3:ListBucket", "s3:DeleteObject"]
       Resource = [
-        aws_s3_bucket.raw.arn,
-        "${aws_s3_bucket.raw.arn}/*",
-        aws_s3_bucket.curated.arn,
-        "${aws_s3_bucket.curated.arn}/*",
+        aws_s3_bucket.raw.arn, "${aws_s3_bucket.raw.arn}/*",
+        aws_s3_bucket.curated.arn, "${aws_s3_bucket.curated.arn}/*",
+        aws_s3_bucket.glue_assets.arn, "${aws_s3_bucket.glue_assets.arn}/*",
       ]
     }]
   })
