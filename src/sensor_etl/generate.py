@@ -30,7 +30,11 @@ from sensor_etl.config import (
 
 
 def build_fleet(seed: int | None = None) -> list[dict]:
-    """Create the static device roster (device_id, type, facility, zone, firmware)."""
+    """Create the static device roster (device_id, type, facility, zone, firmware).
+
+    seed is what keeps facility/zone/firmware assignment identical across
+    every run -- don't pass a different value unless resetting it on purpose.
+    """
     if seed is not None:
         random.seed(seed)
 
@@ -101,6 +105,10 @@ def inject_bad_data(record: dict) -> dict:
 
 
 def generate_hour(fleet: list[dict], ts: datetime) -> list[dict]:
+    # Reseeded per exact timestamp (date+hour), not left continuous across
+    # calls -- reruns of the same hour reproduce identically, while
+    # different hours/dates genuinely differ. Doesn't affect fleet assignment.
+    random.seed(f"pulsegrid-{ts.isoformat()}")
     records = []
     for device in fleet:
         if random.random() < DEVICE_DROPOUT_RATE:
@@ -159,6 +167,8 @@ def main():
     parser.add_argument("--days", type=int, help="Generate the last N days up to now")
     parser.add_argument("--start", type=str, help="Start date, YYYY-MM-DD")
     parser.add_argument("--end", type=str, help="End date, YYYY-MM-DD (default: today)")
+    # Fixed default (not random) so facility/zone assignment stays identical
+    # across every run. Override only to intentionally reset the fleet.
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
