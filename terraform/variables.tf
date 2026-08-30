@@ -16,3 +16,9 @@ variable "aws_region" {
   type        = string
   default     = "ap-south-1"
 }
+
+variable "redshift_admin_password" {
+  description = "Admin password for the Redshift Serverless namespace"
+  type        = string
+  sensitive   = true
+}
