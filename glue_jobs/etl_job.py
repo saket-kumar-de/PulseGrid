@@ -56,6 +56,12 @@ numeric_cols = ["battery_pct", "temperature_c", "humidity_pct", "vibration_mm_s"
 
 
 def write_audit_record(clean_count=0, quarantine_count=0, note=None):
+    # Self-reported only on success -- failure records are written by the
+    # orchestrator instead, from the outside, since a crashed job never
+    # reaches either call site below. Plain boto3, not a Spark write: one
+    # small JSON object, so a distributed writer would be pure overhead.
+    # JOB_RUN_ID in the key means reruns of the same date never collide
+    # with a previous run's audit record.
     record = {
         "run_id": job_run_id,
         "target_date": target_date,
@@ -107,6 +113,8 @@ RANGES = {
 
 
 def out_of_range_expr():
+    # OR's together per-device-type range checks: a row only trips a check
+    # if it's that device type AND that field is outside its valid range.
     expr = F.lit(False)
     for device_type, checks in RANGES.items():
         for col, lo, hi in checks:
@@ -116,16 +124,21 @@ def out_of_range_expr():
     return expr
 
 
+# A row is bad if any required field is null
 REQUIRED_COLS = ["device_id", "device_type", "event_ts", "battery_pct"]
 null_check = F.lit(False)
 for c in REQUIRED_COLS:
     null_check = null_check | F.col(c).isNull()
 
+# Flags rows whose (device_id, event_ts) pair appears more than once
 dup_window = Window.partitionBy("device_id", "event_ts")
 df = df.withColumn("_dup", F.count("*").over(dup_window) > 1)
 df = df.withColumn("_null", null_check)
 df = df.withColumn("_range", out_of_range_expr())
 df = df.withColumn("_is_bad", F.col("_dup") | F.col("_null") | F.col("_range"))
+
+# Cache once so the counts and both writes below reuse this instead of
+# each separately re-reading and re-transforming from raw
 df.cache()
 
 clean_df = df.filter(~F.col("_is_bad")).drop("_dup", "_null", "_range", "_is_bad", "timestamp")
@@ -134,14 +147,16 @@ quarantine_df = df.filter(F.col("_is_bad")).drop("_dup", "_null", "_range", "_is
 clean_count = clean_df.count()
 quarantine_count = quarantine_df.count()
 
+# Clean -> Parquet (columnar, efficient for later Athena/Redshift queries)
 clean_df.write.mode("overwrite").partitionBy("dt", "hour") \
     .parquet(f"s3://{args['curated_bucket']}/sensor_readings/")
 
+# Quarantined -> JSON, deliberately human-readable for manual inspection
 quarantine_df.write.mode("overwrite").partitionBy("dt", "hour") \
     .json(f"s3://{args['curated_bucket']}/quarantine/sensor_readings/")
 
 df.unpersist()
 
-write_audit_record(clean_count=clean_count, quarantine_count=quarantine_count)
+write_audit_record(clean_count=clean_count, quarantine_count=quarantine_count)  # normal success path
 
 job.commit()
