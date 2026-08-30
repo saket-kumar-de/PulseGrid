@@ -17,11 +17,12 @@ args = getResolvedOptions(
     ["JOB_NAME", "raw_database", "raw_table", "curated_bucket", "target_date"],
 )
 
+
 # JOB_RUN_ID is deliberately NOT requested via getResolvedOptions above --
 # awsglue's parser treats it as an internally-reserved name and errors with
 # "conflicting option string" if you also list it yourself. Extracted
-# manually instead, same pattern as --hours, with a fallback in case it
-# isn't present under this exact flag.
+# manually instead, with a fallback in case it isn't present under this
+# exact flag.
 def _extract_arg(flag_name):
     flag = f"--{flag_name}"
     if flag in sys.argv:
@@ -29,11 +30,11 @@ def _extract_arg(flag_name):
         return sys.argv[idx + 1]
     return None
 
+
 job_run_id = _extract_arg("JOB_RUN_ID") or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
 
-# Manual optional-argument parsing -- NOT a second getResolvedOptions call,
-# since awsglue's parser errors on being invoked more than once per script
-# ("conflicting option string" on JOB_RUN_ID).
+# hours is optional -- parsed the same manual way as JOB_RUN_ID above, for
+# the same reserved-name reason.
 if "--hours" in sys.argv:
     idx = sys.argv.index("--hours")
     hours = json.loads(sys.argv[idx + 1])
@@ -63,20 +64,52 @@ else:
 numeric_cols = ["battery_pct", "temperature_c", "humidity_pct", "vibration_mm_s",
                  "rpm", "door_open_count", "energy_kwh", "voltage"]
 
+
+def write_audit_record(clean_count=0, quarantine_count=0, note=None):
+    # Self-reported only on success -- a crashed job never reaches this,
+    # so failure records are written by the orchestrator instead, from
+    # the outside. JOB_RUN_ID in the key means reruns never collide.
+    record = {
+        "run_id": job_run_id,
+        "target_date": target_date,
+        "hours_processed": hours if hours else "ALL",
+        "status": "SUCCESS",
+        "started_at": datetime.fromtimestamp(start_time, tz=timezone.utc).isoformat(),
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "duration_seconds": round(time.time() - start_time, 1),
+        "records_clean": clean_count,
+        "records_quarantined": quarantine_count,
+    }
+    if note:
+        record["note"] = note
+    boto3.client("s3").put_object(
+        Bucket=args["curated_bucket"],
+        Key=f"audit/pipeline_runs/dt={target_date}/run_{job_run_id}.json",
+        Body=json.dumps(record).encode("utf-8"),
+    )
+
+
 raw_dyf = glueContext.create_dynamic_frame.from_catalog(
     database=args["raw_database"],
     table_name=args["raw_table"],
     push_down_predicate=predicate,
 )
 
-# The corrupted 999999 sentinel is an int while normal readings are floats,
-# so some numeric columns have mixed JSON types across records. The
-# DynamicFrame represents this as an ambiguous "choice" struct
-# (struct<double:double,int:int>) rather than a plain double.
-# resolveChoice collapses each one to a single double column BEFORE
-# converting to a Spark DataFrame, where a plain .cast() can't handle it.
-raw_dyf = raw_dyf.resolveChoice(specs=[(c, "cast:double") for c in numeric_cols])
+# push_down_predicate matching ZERO partitions (e.g. every requested hour
+# genuinely has no data) leaves the DynamicFrame with no inferable schema
+# at all -- not just zero rows. Downstream named-column transforms would
+# fail on this. Treat "nothing matched" as a valid, non-error outcome.
+if raw_dyf.count() == 0:
+    write_audit_record(note="no matching raw data found for the requested date/hours")
+    job.commit()
+    sys.exit(0)
 
+# Some numeric fields mix ints (corrupted 999999 sentinel) and floats
+# (normal readings) across records -- Glue represents this as an
+# ambiguous "choice" struct rather than a plain double. resolveChoice
+# collapses it to double BEFORE converting to a DataFrame, where a plain
+# .cast() can't handle it.
+raw_dyf = raw_dyf.resolveChoice(specs=[(c, "cast:double") for c in numeric_cols])
 df = raw_dyf.toDF()
 
 # Raw keeps timestamp as a string (schema-on-read); cast to real types here
@@ -141,24 +174,6 @@ quarantine_df.write.mode("overwrite").partitionBy("dt", "hour") \
 
 df.unpersist()
 
-# Self-reported only on success. Failure records are written by the
-# orchestrator instead, from the outside -- a crashed job never reaches this line.
-duration_seconds = round(time.time() - start_time, 1)
-audit_record = {
-    "run_id": job_run_id,
-    "target_date": target_date,
-    "hours_processed": hours if hours else "ALL",
-    "status": "SUCCESS",
-    "started_at": datetime.fromtimestamp(start_time, tz=timezone.utc).isoformat(),
-    "completed_at": datetime.now(timezone.utc).isoformat(),
-    "duration_seconds": duration_seconds,
-    "records_clean": clean_count,
-    "records_quarantined": quarantine_count,
-}
-boto3.client("s3").put_object(
-    Bucket=args["curated_bucket"],
-    Key=f"audit/pipeline_runs/dt={target_date}/run_{job_run_id}.json",
-    Body=json.dumps(audit_record).encode("utf-8"),
-)
+write_audit_record(clean_count=clean_count, quarantine_count=quarantine_count)  # normal success path
 
 job.commit()
