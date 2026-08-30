@@ -18,6 +18,11 @@ args = getResolvedOptions(
 )
 
 
+# JOB_RUN_ID is deliberately NOT requested via getResolvedOptions above --
+# awsglue's parser treats it as an internally-reserved name and errors with
+# "conflicting option string" if you also list it yourself. Extracted
+# manually instead, with a fallback in case it isn't present under this
+# exact flag.
 def _extract_arg(flag_name):
     flag = f"--{flag_name}"
     if flag in sys.argv:
@@ -28,6 +33,8 @@ def _extract_arg(flag_name):
 
 job_run_id = _extract_arg("JOB_RUN_ID") or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
 
+# hours is optional -- parsed the same manual way as JOB_RUN_ID above, for
+# the same reserved-name reason.
 if "--hours" in sys.argv:
     idx = sys.argv.index("--hours")
     hours = json.loads(sys.argv[idx + 1])
@@ -42,9 +49,12 @@ spark = glueContext.spark_session
 job = Job(glueContext)
 job.init(args["JOB_NAME"], args)
 
+# Required for idempotent reruns: only writes touching dt/hour partitions
+# present in THIS run's output get replaced, not the whole dataset.
 spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
 target_date = args["target_date"]
 
+# Whole day, or specific hours within it (catch-up case)
 if hours:
     hour_list_sql = ", ".join(f"'{h}'" for h in hours)
     predicate = f"dt = '{target_date}' AND hour IN ({hour_list_sql})"
@@ -56,12 +66,9 @@ numeric_cols = ["battery_pct", "temperature_c", "humidity_pct", "vibration_mm_s"
 
 
 def write_audit_record(clean_count=0, quarantine_count=0, note=None):
-    # Self-reported only on success -- failure records are written by the
-    # orchestrator instead, from the outside, since a crashed job never
-    # reaches either call site below. Plain boto3, not a Spark write: one
-    # small JSON object, so a distributed writer would be pure overhead.
-    # JOB_RUN_ID in the key means reruns of the same date never collide
-    # with a previous run's audit record.
+    # Self-reported only on success -- a crashed job never reaches this,
+    # so failure records are written by the orchestrator instead, from
+    # the outside. JOB_RUN_ID in the key means reruns never collide.
     record = {
         "run_id": job_run_id,
         "target_date": target_date,
@@ -97,13 +104,23 @@ if raw_dyf.count() == 0:
     job.commit()
     sys.exit(0)
 
+# Some numeric fields mix ints (corrupted 999999 sentinel) and floats
+# (normal readings) across records -- Glue represents this as an
+# ambiguous "choice" struct rather than a plain double. resolveChoice
+# collapses it to double BEFORE converting to a DataFrame, where a plain
+# .cast() can't handle it.
 raw_dyf = raw_dyf.resolveChoice(specs=[(c, "cast:double") for c in numeric_cols])
 df = raw_dyf.toDF()
 
+# Raw keeps timestamp as a string (schema-on-read); cast to real types here
 df = df.withColumn("event_ts", F.to_timestamp("timestamp"))
+
 for c in numeric_cols:
     df = df.withColumn(c, F.col(c).cast(DoubleType()))
 
+# --- DQ gate: flags the 3 corruption modes the simulator injects --
+# null required fields, out-of-range values, and exact duplicates.
+# Mirrors sensor_etl/config.py's valid ranges exactly.
 RANGES = {
     "hvac_unit":         [("temperature_c", 18.0, 26.0), ("humidity_pct", 30.0, 60.0)],
     "motor":             [("vibration_mm_s", 0.5, 4.5), ("rpm", 800, 3600)],
