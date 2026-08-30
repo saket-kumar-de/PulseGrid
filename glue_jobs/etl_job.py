@@ -72,7 +72,7 @@ def write_audit_record(clean_count=0, quarantine_count=0, note=None):
     record = {
         "run_id": job_run_id,
         "target_date": target_date,
-        "hours_processed": hours if hours else "ALL",
+        "hours_processed": ",".join(hours) if hours else "ALL",
         "status": "SUCCESS",
         "started_at": datetime.fromtimestamp(start_time, tz=timezone.utc).isoformat(),
         "completed_at": datetime.now(timezone.utc).isoformat(),
