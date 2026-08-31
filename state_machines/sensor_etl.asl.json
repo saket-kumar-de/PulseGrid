@@ -1,0 +1,131 @@
+{
+  "Comment": "PulseGrid sensor_etl orchestration",
+  "StartAt": "ClaimLock",
+  "States": {
+    "ClaimLock": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "pulsegrid-dev-watermarks",
+        "Key": { "pipeline_id": {"S": "sensor_etl"} },
+        "UpdateExpression": "SET #s = :running",
+        "ConditionExpression": "attribute_not_exists(#s) OR #s <> :running",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {":running": {"S": "RUNNING"}}
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["DynamoDB.ConditionalCheckFailedException"], "Next": "AlreadyRunning" }],
+      "Next": "StartRawCrawler"
+    },
+    "AlreadyRunning": { "Type": "Succeed" },
+
+    "StartRawCrawler": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+      "Parameters": { "Name": "pulsegrid-dev-raw-crawler" },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "ReleaseLockOnFailure", "ResultPath": "$.error" }],
+      "Next": "WaitForCrawler"
+    },
+    "WaitForCrawler": {
+      "Type": "Wait",
+      "Seconds": 20,
+      "Next": "GetCrawlerStatus"
+    },
+    "GetCrawlerStatus": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler",
+      "Parameters": { "Name": "pulsegrid-dev-raw-crawler" },
+      "ResultPath": "$.crawlerStatus",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "ReleaseLockOnFailure", "ResultPath": "$.error" }],
+      "Next": "CheckCrawlerStatus"
+    },
+    "CheckCrawlerStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.crawlerStatus.Crawler.State",
+          "StringEquals": "READY",
+          "Next": "GetMissingHours"
+        }
+      ],
+      "Default": "WaitForCrawler"
+    },
+
+    "GetMissingHours": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "pulsegrid-dev-missing-hours" },
+      "ResultSelector": { "missing_groups.$": "$.Payload.missing_groups" },
+      "ResultPath": "$.lambdaResult",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "ReleaseLockOnFailure", "ResultPath": "$.error" }],
+      "Next": "ProcessDateGroups"
+    },
+    "ProcessDateGroups": {
+      "Type": "Map",
+      "ItemsPath": "$.lambdaResult.missing_groups",
+      "MaxConcurrency": 1,
+      "Iterator": {
+        "StartAt": "RunGlueJob",
+        "States": {
+          "RunGlueJob": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "pulsegrid-dev-sensor-etl",
+                "Arguments": {
+                  "--target_date.$": "$.dt",
+                  "--hours.$": "States.JsonToString($.hours)"
+                }
+              },
+              "Retry": [{ "ErrorEquals": ["Glue.ConcurrentRunsExceededException"], "IntervalSeconds": 60, "MaxAttempts": 3, "BackoffRate": 2.0 }],
+              "ResultPath": "$.glueResult",
+              "Next": "AdvanceWatermark"
+            },
+          "AdvanceWatermark": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::dynamodb:updateItem",
+            "Parameters": {
+              "TableName": "pulsegrid-dev-watermarks",
+              "Key": { "pipeline_id": {"S": "sensor_etl"} },
+              "UpdateExpression": "SET last_loaded_dt = :dt, last_loaded_hour = :hour",
+              "ExpressionAttributeValues": {
+                ":dt": {"S.$": "$.dt"},
+                ":hour": {"S.$": "$.last_hour"}
+              }
+            },
+            "End": true
+          }
+        }
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "ReleaseLockOnFailure", "ResultPath": "$.error" }],
+      "Next": "ReleaseLockOnSuccess"
+    },
+    "ReleaseLockOnSuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "pulsegrid-dev-watermarks",
+        "Key": { "pipeline_id": {"S": "sensor_etl"} },
+        "UpdateExpression": "SET #s = :idle",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {":idle": {"S": "IDLE"}}
+      },
+      "End": true
+    },
+    "ReleaseLockOnFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "pulsegrid-dev-watermarks",
+        "Key": { "pipeline_id": {"S": "sensor_etl"} },
+        "UpdateExpression": "SET #s = :idle",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {":idle": {"S": "IDLE"}}
+      },
+      "Next": "Fail"
+    },
+    "Fail": { "Type": "Fail" }
+  }
+}

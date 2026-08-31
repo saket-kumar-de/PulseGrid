@@ -40,4 +40,4 @@ def lambda_handler(event, context):
     for h in missing_hours:
         groups.setdefault(h.strftime("%Y-%m-%d"), []).append(h.strftime("%H"))
 
-    return {"missing_groups": [{"dt": dt, "hours": hours} for dt, hours in sorted(groups.items())]}
+    return {"missing_groups": [{"dt": dt, "hours": hours, "last_hour": hours[-1]} for dt, hours in sorted(groups.items())]}
