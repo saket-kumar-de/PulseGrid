@@ -36,3 +36,21 @@ resource "aws_iam_role_policy" "glue_s3_access" {
     }]
   })
 }
+
+# Lets the Glue job self-write its own watermark advance directly (see
+# etl_job.py's advance_watermark()) -- UpdateItem only, no GetItem needed,
+# since the forward-only comparison happens entirely inside DynamoDB's own
+# atomic ConditionExpression, never read back into the script.
+resource "aws_iam_role_policy" "glue_watermark_access" {
+  name = "${var.project_name}-${var.environment}-glue-watermark-access"
+  role = aws_iam_role.glue_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["dynamodb:UpdateItem"]
+      Resource = aws_dynamodb_table.watermarks.arn
+    }]
+  })
+}

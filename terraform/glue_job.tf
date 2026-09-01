@@ -28,6 +28,7 @@ resource "aws_glue_job" "sensor_etl" {
     "--raw_database"                     = aws_glue_catalog_database.raw.name
     "--raw_table"                        = "pulsegrid_dev_raw"
     "--curated_bucket"                   = aws_s3_bucket.curated.bucket
+    "--watermark_table"                  = aws_dynamodb_table.watermarks.name
     "--enable-metrics"                   = "true"
     "--enable-continuous-cloudwatch-log" = "true"
     "--TempDir"                          = "s3://${aws_s3_bucket.glue_assets.bucket}/glue-temp/"
