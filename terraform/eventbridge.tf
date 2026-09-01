@@ -38,5 +38,8 @@ resource "aws_scheduler_schedule" "sensor_etl_daily" {
   target {
     arn      = aws_sfn_state_machine.sensor_etl.arn
     role_arn = aws_iam_role.scheduler_sensor_etl.arn
+    input = jsonencode({
+      mode = "glue_only"
+    })
   }
 }

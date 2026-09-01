@@ -1,7 +1,37 @@
 {
-  "Comment": "PulseGrid sensor_etl orchestration",
-  "StartAt": "ClaimLock",
+  "Comment": "PulseGrid combined orchestration -- glue/sensor_etl section fully rebuilt (single multi-date Glue call, self-written watermark, lock claimed only when real work exists). redshift_refresh section is a temporary stub pending its own branch.",
+  "StartAt": "ModeCheck1",
   "States": {
+    "ModeCheck1": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.mode", "StringEquals": "redshift_only", "Next": "RedshiftSectionNotYetImplemented" }
+      ],
+      "Default": "GetMissingHours"
+    },
+
+    "GetMissingHours": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "pulsegrid-dev-missing-hours",
+        "Payload.$": "$"
+      },
+      "ResultSelector": { "missing_groups.$": "$.Payload.missing_groups" },
+      "ResultPath": "$.lambdaResult",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "Fail", "ResultPath": "$.error" }],
+      "Next": "CheckIfAnyMissing"
+    },
+
+    "CheckIfAnyMissing": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.lambdaResult.missing_groups[0]", "IsPresent": true, "Next": "ClaimLock" }
+      ],
+      "Default": "AllCaughtUp"
+    },
+    "AllCaughtUp": { "Type": "Succeed" },
+
     "ClaimLock": {
       "Type": "Task",
       "Resource": "arn:aws:states:::dynamodb:updateItem",
@@ -43,65 +73,26 @@
     "CheckCrawlerStatus": {
       "Type": "Choice",
       "Choices": [
-        {
-          "Variable": "$.crawlerStatus.Crawler.State",
-          "StringEquals": "READY",
-          "Next": "GetMissingHours"
-        }
+        { "Variable": "$.crawlerStatus.Crawler.State", "StringEquals": "READY", "Next": "RunGlueJob" }
       ],
       "Default": "WaitForCrawler"
     },
 
-    "GetMissingHours": {
+    "RunGlueJob": {
       "Type": "Task",
-      "Resource": "arn:aws:states:::lambda:invoke",
-      "Parameters": { "FunctionName": "pulsegrid-dev-missing-hours" },
-      "ResultSelector": { "missing_groups.$": "$.Payload.missing_groups" },
-      "ResultPath": "$.lambdaResult",
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "ReleaseLockOnFailure", "ResultPath": "$.error" }],
-      "Next": "ProcessDateGroups"
-    },
-    "ProcessDateGroups": {
-      "Type": "Map",
-      "ItemsPath": "$.lambdaResult.missing_groups",
-      "MaxConcurrency": 1,
-      "Iterator": {
-        "StartAt": "RunGlueJob",
-        "States": {
-          "RunGlueJob": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::glue:startJobRun.sync",
-              "Parameters": {
-                "JobName": "pulsegrid-dev-sensor-etl",
-                "Arguments": {
-                  "--target_date.$": "$.dt",
-                  "--hours.$": "States.JsonToString($.hours)"
-                }
-              },
-              "Retry": [{ "ErrorEquals": ["Glue.ConcurrentRunsExceededException"], "IntervalSeconds": 60, "MaxAttempts": 3, "BackoffRate": 2.0 }],
-              "ResultPath": "$.glueResult",
-              "Next": "AdvanceWatermark"
-            },
-          "AdvanceWatermark": {
-            "Type": "Task",
-            "Resource": "arn:aws:states:::dynamodb:updateItem",
-            "Parameters": {
-              "TableName": "pulsegrid-dev-watermarks",
-              "Key": { "pipeline_id": {"S": "sensor_etl"} },
-              "UpdateExpression": "SET last_loaded_dt = :dt, last_loaded_hour = :hour",
-              "ExpressionAttributeValues": {
-                ":dt": {"S.$": "$.dt"},
-                ":hour": {"S.$": "$.last_hour"}
-              }
-            },
-            "End": true
-          }
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "pulsegrid-dev-sensor-etl",
+        "Arguments": {
+          "--date_groups.$": "States.JsonToString($.lambdaResult.missing_groups)"
         }
       },
-      "ResultPath": null,
+      "Retry": [{ "ErrorEquals": ["Glue.ConcurrentRunsExceededException"], "IntervalSeconds": 60, "MaxAttempts": 3, "BackoffRate": 2.0 }],
       "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "ReleaseLockOnFailure", "ResultPath": "$.error" }],
+      "ResultPath": "$.glueResult",
       "Next": "ReleaseLockOnSuccess"
     },
+
     "ReleaseLockOnSuccess": {
       "Type": "Task",
       "Resource": "arn:aws:states:::dynamodb:updateItem",
@@ -112,8 +103,20 @@
         "ExpressionAttributeNames": {"#s": "status"},
         "ExpressionAttributeValues": {":idle": {"S": "IDLE"}}
       },
-      "End": true
+      "ResultPath": null,
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2.0 }],
+      "Next": "ModeCheck2"
     },
+
+    "ModeCheck2": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.mode", "StringEquals": "glue_only", "Next": "GlueOnlyComplete" }
+      ],
+      "Default": "RedshiftSectionNotYetImplemented"
+    },
+    "GlueOnlyComplete": { "Type": "Succeed" },
+
     "ReleaseLockOnFailure": {
       "Type": "Task",
       "Resource": "arn:aws:states:::dynamodb:updateItem",
@@ -124,8 +127,16 @@
         "ExpressionAttributeNames": {"#s": "status"},
         "ExpressionAttributeValues": {":idle": {"S": "IDLE"}}
       },
+      "ResultPath": null,
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2.0 }],
       "Next": "Fail"
     },
-    "Fail": { "Type": "Fail" }
+    "Fail": { "Type": "Fail" },
+
+    "RedshiftSectionNotYetImplemented": {
+      "Type": "Fail",
+      "Error": "NotImplemented",
+      "Cause": "The redshift_refresh section has not been built yet on this branch. Use mode=glue_only until it exists. The EventBridge trigger remains disabled in the meantime, so this has no real-world impact today."
+    }
   }
 }
