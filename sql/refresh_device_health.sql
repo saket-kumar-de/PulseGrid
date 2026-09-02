@@ -1,4 +1,4 @@
-DELETE FROM daily_device_health_summary WHERE dt = CAST(:target_date AS DATE);
+DELETE FROM daily_device_health_summary WHERE dt BETWEEN :start_date AND :end_date;
 
 INSERT INTO daily_device_health_summary
 WITH clean_agg AS (
@@ -7,13 +7,13 @@ WITH clean_agg AS (
            AVG(battery_pct) AS avg_battery_pct,
            MIN(battery_pct) AS min_battery_pct
     FROM curated_spectrum.sensor_readings
-    WHERE dt = :target_date
+    WHERE dt BETWEEN :start_date AND :end_date
     GROUP BY dt, device_type, facility_id
 ),
 quarantine_agg AS (
     SELECT dt, device_type, facility_id, COUNT(*) AS quarantined_reading_count
     FROM curated_spectrum.quarantine_sensor_readings
-    WHERE dt = :target_date
+    WHERE dt BETWEEN :start_date AND :end_date
     GROUP BY dt, device_type, facility_id
 )
 SELECT

@@ -22,3 +22,9 @@ variable "redshift_admin_password" {
   type        = string
   sensitive   = true
 }
+
+variable "redshift_refresh_svc_password" {
+  description = "Password for the redshift_refresh_svc database user (least-privilege, used by the Redshift Data API for automated refreshes)"
+  type        = string
+  sensitive   = true
+}
