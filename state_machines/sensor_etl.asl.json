@@ -5,7 +5,13 @@
     "ModeCheck1": {
       "Type": "Choice",
       "Choices": [
-        { "Variable": "$.mode", "StringEquals": "redshift_only", "Next": "GetMissingDates" }
+        {
+          "And": [
+            { "Variable": "$.mode", "IsPresent": true },
+            { "Variable": "$.mode", "StringEquals": "redshift_only" }
+          ],
+          "Next": "GetMissingDates"
+        }
       ],
       "Default": "GetMissingHours"
     },
@@ -111,7 +117,13 @@
     "ModeCheck2": {
       "Type": "Choice",
       "Choices": [
-        { "Variable": "$.mode", "StringEquals": "glue_only", "Next": "ExecutionComplete" }
+        {
+          "And": [
+            { "Variable": "$.mode", "IsPresent": true },
+            { "Variable": "$.mode", "StringEquals": "glue_only" }
+          ],
+          "Next": "ExecutionComplete"
+        }
       ],
       "Default": "GetMissingDates"
     },
