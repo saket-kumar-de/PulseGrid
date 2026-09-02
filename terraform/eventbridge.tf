@@ -26,7 +26,7 @@ resource "aws_iam_role_policy" "scheduler_sensor_etl_access" {
 resource "aws_scheduler_schedule" "sensor_etl_daily" {
   name        = "${var.project_name}-${var.environment}-sensor-etl-daily"
   description = "Triggers sensor_etl daily at 00:30 UTC"
-  state       = "DISABLED"
+  state       = "ENABLED"
 
   flexible_time_window {
     mode = "OFF"
@@ -39,7 +39,7 @@ resource "aws_scheduler_schedule" "sensor_etl_daily" {
     arn      = aws_sfn_state_machine.sensor_etl.arn
     role_arn = aws_iam_role.scheduler_sensor_etl.arn
     input = jsonencode({
-      mode = "glue_only"
+      mode = "full"
     })
   }
 }
