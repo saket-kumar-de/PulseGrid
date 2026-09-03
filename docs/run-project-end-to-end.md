@@ -36,7 +36,7 @@ aws stepfunctions describe-execution --execution-arn <executionArn> --query "sta
 
 ### Common input shapes
 
-Full pipeline, both sections (this is also exactly what the real scheduled trigger sends — no `mode` field at all):
+Full pipeline, both sections:
 ```json
 {}
 ```
@@ -44,6 +44,11 @@ or explicitly:
 ```json
 {"mode": "full"}
 ```
+Either works identically — both `ModeCheck1` and `ModeCheck2` treat an absent `mode` the same as `mode="full"`. This isn't quite what the real scheduled trigger literally sends, though: the actual deployed schedule sends `{"mode":"full","triggered_by":"schedule"}` — confirmable directly:
+```bash
+aws scheduler get-schedule --name pulsegrid-dev-sensor-etl-daily --query "Target.Input" --output text
+```
+`triggered_by` only affects whether a *failure* gets emailed — it has no bearing on which sections run.
 
 Just `sensor_etl`:
 ```json
@@ -61,6 +66,14 @@ Backfilling a specific historical range (works combined with any `mode` above �
 ```
 
 The regression guard means this is always safe to run against dates that are already correctly loaded — the underlying data reprocesses cleanly (idempotent), but neither watermark will move backward.
+
+Note: none of these manual examples include `triggered_by` — that's intentional. Only the real EventBridge trigger sends it, which is precisely what keeps a manual test run's failure silent instead of emailing you. See [Interpreting a failed execution](#interpreting-a-failed-execution) below.
+
+If you specifically want to verify the failure-notification path itself works — worth doing once, right after setup — you can deliberately include it in a manual test:
+```json
+{"mode": "glue_only", "triggered_by": "schedule", "backfill": {"start_date": "2026-06-05", "end_date": "2026-06-01"}}
+```
+This combines a deliberately-reversed `backfill` range (a safe, guaranteed failure) with the schedule marker, so you can confirm a real email arrives without needing to wait for an actual failure.
 
 ## Checking watermark state
 
@@ -120,6 +133,11 @@ pytest tests/ -v
 ```
    Seeing this specific line is normal, expected behavior for an out-of-order backfill — not an error to chase.
 3. **A `FAILED` or `ABORTED` Redshift statement** is visible directly via `DescribeRedshiftStatement`'s output in that state's own execution detail, without needing to leave the console.
+4. **If the failure was on the real scheduled trigger**, an email should already be sitting in the alert inbox — check spam if it's not in the primary inbox. If it's missing entirely, confirm the subscription is actually active, not just requested:
+```bash
+   aws sns list-subscriptions-by-topic --topic-arn <topic-arn-from-terraform-output>
+```
+   `"SubscriptionArn": "PendingConfirmation"` means the one-time confirmation email was never clicked — see [`setup.md`](setup.md). A manually-triggered execution's failure never sends an email at all, by design — this step only applies to a real scheduled run.
 
 ## If a lock ever appears stuck
 

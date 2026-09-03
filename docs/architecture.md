@@ -36,7 +36,7 @@ The complete inventory of every AWS component in PulseGrid, what it does, and ho
 
 | Component | Role |
 |---|---|
-| Step Functions state machine | One combined definition covering both `sensor_etl` and `redshift_refresh`, gated by a `mode` parameter and an independent `backfill` parameter. |
+| Step Functions state machine | One combined definition covering both `sensor_etl` and `redshift_refresh`, gated by a `mode` parameter and an independent `backfill` parameter. Every failure path converges on a shared gate that emails a failure notification, but only for the real scheduled trigger — see [`architecture-flow.md`](architecture-flow.md#failure-notifications). |
 | EventBridge Scheduler — `generate_hourly` | Fires hourly, on the hour (`cron(0 * * * ? *)`, UTC). |
 | EventBridge Scheduler — `sensor_etl_daily` | Fires daily at `00:30 UTC` — 30 minutes after `generate_hourly`'s midnight run closes out the previous day, so a full day is always ready. Drives the *entire* combined state machine (both pipeline sections) via `mode=full`. |
 
@@ -51,6 +51,7 @@ The complete inventory of every AWS component in PulseGrid, what it does, and ho
 | Component | Role |
 |---|---|
 | Secrets Manager secret | Holds `redshift_refresh_svc`'s database credentials for the Redshift Data API. |
+| SNS topic | One topic, one email subscription, for pipeline failure notifications. Requires a one-time manual confirmation click after deployment — see [`setup.md`](setup.md). |
 | IAM roles (one per component) | Every Lambda, the Glue job, and the state machine's own execution role each get a distinct, narrowly-scoped role — see [Security model](#security-model) below. |
 
 ### Analytics (verification tool, not part of the live pipeline)
@@ -136,4 +137,4 @@ Single table, `pipeline_id` as partition key. Two items exist, one per pipeline:
 
 ## Security model
 
-Every component gets its **own** IAM role, scoped to exactly what it needs — never a shared or broad role. A few concrete examples: `generate_hourly`'s role has `s3:PutObject` on `raw` only — no read, list, or delete. `missing_dates`' role has `dynamodb:GetItem` only — it never writes. The Glue job's role has `dynamodb:UpdateItem` scoped to the one watermarks table, nothing broader. This pattern holds throughout — no component can do more than its own specific job requires.
+Every component gets its **own** IAM role, scoped to exactly what it needs — never a shared or broad role. A few concrete examples: `generate_hourly`'s role has `s3:PutObject` on `raw` only — no read, list, or delete. `missing_dates`' role has `dynamodb:GetItem` only — it never writes. The Glue job's role has `dynamodb:UpdateItem` scoped to the one watermarks table, nothing broader. The state machine's own execution role has `sns:Publish` scoped to exactly the one failure-notification topic — nothing broader, and it's a distinct grant from the *deploy user's* own SNS permissions (topic creation, subscription management), which exist only to let Terraform provision the topic in the first place, never to publish to it. This pattern holds throughout — no component can do more than its own specific job requires.

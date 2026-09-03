@@ -71,7 +71,7 @@
       "ResultSelector": { "missing_groups.$": "$.Payload.missing_groups" },
       "ResultPath": "$.lambdaResult",
       "Catch": [
-        { "ErrorEquals": ["States.ALL"], "Next": "Fail", "ResultPath": "$.error" }
+        { "ErrorEquals": ["States.ALL"], "Next": "CheckIfScheduledFailure", "ResultPath": "$.error" }
       ],
       "Next": "CheckIfAnyMissing"
     },
@@ -139,7 +139,7 @@
         "ExpressionAttributeValues": { ":idle": { "S": "IDLE" } }
       },
       "ResultPath": null,
-      "Next": "Fail",
+      "Next": "CheckIfScheduledFailure",
       "Retry": [
         { "ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2.0 }
       ]
@@ -159,7 +159,7 @@
       },
       "ResultPath": "$.redshiftResult",
       "Catch": [
-        { "ErrorEquals": ["States.ALL"], "Next": "Fail", "ResultPath": "$.error" }
+        { "ErrorEquals": ["States.ALL"], "Next": "CheckIfScheduledFailure", "ResultPath": "$.error" }
       ],
       "Next": "CheckIfAnyDatesMissing"
     },
@@ -371,6 +371,30 @@
       "Retry": [
         { "ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2.0 }
       ],
+      "Next": "CheckIfScheduledFailure"
+    },
+    "CheckIfScheduledFailure": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            { "Variable": "$.triggered_by", "IsPresent": true },
+            { "Variable": "$.triggered_by", "StringEquals": "schedule" }
+          ],
+          "Next": "PublishFailureNotification"
+        }
+      ],
+      "Default": "Fail"
+    },
+    "PublishFailureNotification": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${sns_topic_arn}",
+        "Subject": "PulseGrid pipeline failure",
+        "Message.$": "States.Format('PulseGrid scheduled execution failed.\n\nExecution: {}\n\nFull state at failure:\n{}', $$.Execution.Name, States.JsonToString($))"
+      },
+      "ResultPath": null,
       "Next": "Fail"
     }
   }

@@ -45,6 +45,11 @@ resource "aws_iam_role_policy" "step_functions_sensor_etl_access" {
         Effect   = "Allow"
         Action   = ["secretsmanager:GetSecretValue"]
         Resource = aws_secretsmanager_secret.redshift_refresh_svc.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["sns:Publish"]
+        Resource = aws_sns_topic.pipeline_failures.arn
       }
     ]
   })
@@ -55,6 +60,7 @@ resource "aws_sfn_state_machine" "sensor_etl" {
   role_arn = aws_iam_role.step_functions_sensor_etl.arn
   definition = templatefile("${path.module}/../state_machines/sensor_etl.asl.json", {
     redshift_secret_arn = aws_secretsmanager_secret.redshift_refresh_svc.arn
+    sns_topic_arn        = aws_sns_topic.pipeline_failures.arn
   })
 
   tags = {
