@@ -41,7 +41,7 @@ Full rationale, trade-offs, and real debugging stories: [`docs/design-choices.md
 
 | Layer | Tools |
 |---|---|
-| Orchestration | AWS Step Functions, EventBridge Scheduler |
+| Orchestration | AWS Step Functions, EventBridge Scheduler, SNS (failure notifications) |
 | Compute | AWS Glue (PySpark), AWS Lambda |
 | Storage | S3, Amazon Redshift Serverless (+ Spectrum) |
 | Coordination | DynamoDB (distributed locks + watermarks) |
@@ -75,7 +75,7 @@ Full rationale, trade-offs, and real debugging stories: [`docs/design-choices.md
 
 ## Running it yourself
 
-**Deploying to your own AWS account requires a few one-time changes first — bucket names, credentials, a manual database user — all covered precisely in [`docs/setup.md`](docs/setup.md). Start there before running the commands below.**
+**Deploying to your own AWS account requires a few one-time changes first — bucket names, credentials, a manual database user, and confirming an email subscription — all covered precisely in [`docs/setup.md`](docs/setup.md). Start there before running the commands below.**
 
 ```bash
 cd terraform
