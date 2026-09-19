@@ -45,6 +45,23 @@ resource "aws_iam_role_policy" "lambda_generate_hourly_s3" {
   })
 }
 
+resource "aws_iam_role_policy" "lambda_generate_hourly_glue" {
+  name = "${var.project_name}-${var.environment}-generate-hourly-glue-access"
+  role = aws_iam_role.lambda_generate_hourly.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["glue:GetTable", "glue:CreatePartition"]
+      Resource = [
+        aws_glue_catalog_database.raw.arn,
+        "arn:aws:glue:*:*:catalog",
+        "arn:aws:glue:*:*:table/${aws_glue_catalog_database.raw.name}/pulsegrid_dev_raw"
+      ]
+    }]
+  })
+}
+
 resource "aws_iam_role_policy_attachment" "lambda_generate_hourly_basic" {
   role       = aws_iam_role.lambda_generate_hourly.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
@@ -61,7 +78,9 @@ resource "aws_lambda_function" "generate_hourly" {
 
   environment {
     variables = {
-      RAW_BUCKET = aws_s3_bucket.raw.bucket
+      RAW_BUCKET   = aws_s3_bucket.raw.bucket
+      RAW_DATABASE = aws_glue_catalog_database.raw.name
+      RAW_TABLE    = "pulsegrid_dev_raw"
     }
   }
 

@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff", "moto", "freezegun"]
+dev = ["pytest", "ruff", "moto[glue]", "freezegun"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

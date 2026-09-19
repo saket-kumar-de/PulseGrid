@@ -13,7 +13,19 @@ from pyspark.sql.window import Window
 from awsglue.context import GlueContext
 from awsglue.job import Job
 
-args = getResolvedOptions(sys.argv, ["JOB_NAME", "raw_database", "raw_table", "curated_bucket", "watermark_table"])
+args = getResolvedOptions(sys.argv, [
+    "JOB_NAME", "raw_database", "raw_table", "curated_bucket",
+    "curated_database", "watermark_table",
+])
+
+# Spectrum reads Glue table partition METADATA, never partition-projection
+# table properties -- that's an Athena-only feature. So every partition
+# this job writes must be explicitly registered, the same way generate_hourly
+# already does for raw. These three names are structural constants, not
+# runtime-parameterized, mirroring generate_hourly's own RAW_TABLE choice.
+CURATED_TABLE = "sensor_readings"
+QUARANTINE_TABLE = "quarantine_sensor_readings"
+PIPELINE_RUNS_TABLE = "pipeline_runs"
 
 
 def _extract_arg(flag_name):
@@ -43,7 +55,76 @@ job.init(args["JOB_NAME"], args)
 spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
 
 dynamodb = boto3.client("dynamodb")
+glue = boto3.client("glue")
 WATERMARK_TABLE = args["watermark_table"]
+CURATED_DATABASE = args["curated_database"]
+
+# Each table's own StorageDescriptor and partition-key order, read ONCE and
+# reused for every partition registered this run -- guarantees consistency
+# with the table's real definition rather than reconstructing one here, and
+# derives Values ordering from the table itself rather than assuming dt-then-
+# hour. Same reasoning as generate_hourly's own cold-start table read.
+def _load_table_meta(table_name):
+    t = glue.get_table(DatabaseName=CURATED_DATABASE, Name=table_name)["Table"]
+    return t["StorageDescriptor"], [k["Name"] for k in t["PartitionKeys"]]
+
+_curated_sd, _curated_key_order = _load_table_meta(CURATED_TABLE)
+_quarantine_sd, _quarantine_key_order = _load_table_meta(QUARANTINE_TABLE)
+_pipeline_runs_sd, _pipeline_runs_key_order = _load_table_meta(PIPELINE_RUNS_TABLE)
+
+
+def register_partitions(table_name, table_sd, key_order, location_prefix, dt_hour_pairs):
+    """Registers a batch of (dt, hour) partitions via BatchCreatePartition,
+    chunked to its 100-per-call limit. AlreadyExistsException entries in the
+    response are expected on a reprocess/backfill and logged, not raised --
+    same as generate_hourly's single-item skip, just via the batch API's own
+    Errors-list response shape rather than a raised exception."""
+    pairs = sorted(dt_hour_pairs)
+    for i in range(0, len(pairs), 100):
+        chunk = pairs[i:i + 100]
+        partition_inputs = []
+        for dt, hour in chunk:
+            values_by_name = {"dt": dt, "hour": hour}
+            sd = dict(table_sd)
+            sd["Location"] = f"{location_prefix}dt={dt}/hour={hour}/"
+            partition_inputs.append({
+                "Values": [values_by_name[k] for k in key_order],
+                "StorageDescriptor": sd,
+            })
+        response = glue.batch_create_partition(
+            DatabaseName=CURATED_DATABASE, TableName=table_name,
+            PartitionInputList=partition_inputs,
+        )
+        real_errors = []
+        for err in response.get("Errors", []):
+            if err["ErrorDetail"]["ErrorCode"] == "AlreadyExistsException":
+                print(f"{table_name}: partition {err['PartitionValues']} already "
+                      f"registered, skipping")
+            else:
+                real_errors.append(err)
+        if real_errors:
+            raise RuntimeError(f"{table_name}: partition registration errors: {real_errors}")
+    print(f"{table_name}: registered {len(pairs)} partition(s)")
+
+
+def register_pipeline_runs_partition(target_date):
+    """pipeline_runs is partitioned by dt only -- one call per audit record,
+    called from inside write_audit_record right after its own S3 write."""
+    values_by_name = {"dt": target_date}
+    sd = dict(_pipeline_runs_sd)
+    sd["Location"] = f"s3://{args['curated_bucket']}/audit/pipeline_runs/dt={target_date}/"
+    try:
+        glue.create_partition(
+            DatabaseName=CURATED_DATABASE, TableName=PIPELINE_RUNS_TABLE,
+            PartitionInput={
+                "Values": [values_by_name[k] for k in _pipeline_runs_key_order],
+                "StorageDescriptor": sd,
+            },
+        )
+        print(f"{PIPELINE_RUNS_TABLE}: registered partition dt={target_date}")
+    except glue.exceptions.AlreadyExistsException:
+        print(f"{PIPELINE_RUNS_TABLE}: partition dt={target_date} already registered, skipping")
+
 
 # Build one OR-of-ANDs predicate covering every requested date/hour combination
 group_predicates = []
@@ -84,6 +165,7 @@ def write_audit_record(target_date, hours_processed, clean_count=0, quarantine_c
         Key=f"audit/pipeline_runs/dt={target_date}/run_{job_run_id}.json",
         Body=json.dumps(record).encode("utf-8"),
     )
+    register_pipeline_runs_partition(target_date)
 
 
 def advance_watermark(new_dt, new_hour):
@@ -188,6 +270,11 @@ else:
     clean_counts = {row["dt"]: row["count"] for row in clean_df.groupBy("dt").count().collect()}
     quarantine_counts = {row["dt"]: row["count"] for row in quarantine_df.groupBy("dt").count().collect()}
 
+    # Distinct (dt, hour) pairs each DataFrame actually produced -- computed
+    # separately, since an hour can be clean-only, quarantine-only, or both.
+    clean_partitions = {(row["dt"], row["hour"]) for row in clean_df.select("dt", "hour").distinct().collect()}
+    quarantine_partitions = {(row["dt"], row["hour"]) for row in quarantine_df.select("dt", "hour").distinct().collect()}
+
     # Clean -> Parquet (columnar, efficient for later Athena/Redshift queries)
     clean_df.write.mode("overwrite").partitionBy("dt", "hour") \
         .parquet(f"s3://{args['curated_bucket']}/sensor_readings/")
@@ -197,6 +284,22 @@ else:
         .json(f"s3://{args['curated_bucket']}/quarantine/sensor_readings/")
 
     df.unpersist()
+
+    # Register every partition actually written -- Spectrum needs real
+    # catalog entries, since it never reads partition-projection properties
+    # at all (an Athena-only feature). Runs AFTER both writes succeed, never
+    # before, so a registered partition never points at data that isn't
+    # there yet.
+    if clean_partitions:
+        register_partitions(
+            CURATED_TABLE, _curated_sd, _curated_key_order,
+            f"s3://{args['curated_bucket']}/sensor_readings/", clean_partitions,
+        )
+    if quarantine_partitions:
+        register_partitions(
+            QUARANTINE_TABLE, _quarantine_sd, _quarantine_key_order,
+            f"s3://{args['curated_bucket']}/quarantine/sensor_readings/", quarantine_partitions,
+        )
 
     # Only dates <= what this run actually confirmed get an audit record --
     # a requested date beyond run_max_dt was never verified as processed,

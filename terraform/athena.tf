@@ -2,29 +2,6 @@ resource "aws_glue_catalog_database" "curated" {
   name = "${var.project_name}_${var.environment}_curated_db"
 }
 
-resource "aws_glue_crawler" "curated" {
-  name          = "${var.project_name}-${var.environment}-curated-crawler"
-  role          = aws_iam_role.glue_role.arn
-  database_name = aws_glue_catalog_database.curated.name
-
-  s3_target {
-    path = "s3://${aws_s3_bucket.curated.bucket}/sensor_readings/"
-  }
-  s3_target {
-    path = "s3://${aws_s3_bucket.curated.bucket}/audit/pipeline_runs/"
-  }
-
-  schema_change_policy {
-    delete_behavior = "LOG"
-    update_behavior = "UPDATE_IN_DATABASE"
-  }
-
-  tags = {
-    Environment = var.environment
-    Project     = var.project_name
-  }
-}
-
 resource "aws_athena_workgroup" "pulsegrid" {
   name = "${var.project_name}-${var.environment}"
 

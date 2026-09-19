@@ -54,3 +54,23 @@ resource "aws_iam_role_policy" "glue_watermark_access" {
     }]
   })
 }
+
+resource "aws_iam_role_policy" "glue_curated_partition_access" {
+  name = "${var.project_name}-${var.environment}-glue-curated-partition-access"
+  role = aws_iam_role.glue_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = ["glue:GetTable", "glue:CreatePartition", "glue:BatchCreatePartition"]
+      Resource = [
+        aws_glue_catalog_database.curated.arn,
+        "arn:aws:glue:*:*:catalog",
+        "arn:aws:glue:*:*:table/${aws_glue_catalog_database.curated.name}/sensor_readings",
+        "arn:aws:glue:*:*:table/${aws_glue_catalog_database.curated.name}/quarantine_sensor_readings",
+        "arn:aws:glue:*:*:table/${aws_glue_catalog_database.curated.name}/pipeline_runs",
+      ]
+    }]
+  })
+}

@@ -60,7 +60,7 @@ terraform plan
 terraform apply
 ```
 
-This creates everything Terraform manages: S3 buckets, Glue crawlers and the ETL job, the Redshift Serverless namespace/workgroup, DynamoDB, all 3 Lambdas, the Step Functions state machine, Secrets Manager, an SNS topic for failure alerts, and both EventBridge schedules.
+This creates everything Terraform manages: S3 buckets, the `raw` Glue crawler (manual-backfill use only — routine data self-registers its own partitions, see [`run-project-end-to-end.md`](run-project-end-to-end.md)), the ETL job, three explicit Glue Catalog tables for `curated`/`quarantine`/`pipeline_runs`, the Redshift Serverless namespace/workgroup, DynamoDB, all 3 Lambdas, the Step Functions state machine, Secrets Manager, an SNS topic for failure alerts, and both EventBridge schedules.
 
 ## 5. Confirm the SNS email subscription — a manual step Terraform can't finish for you
 
