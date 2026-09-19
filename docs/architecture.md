@@ -16,20 +16,18 @@ The complete inventory of every AWS component in PulseGrid, what it does, and ho
 
 | Component | Role |
 |---|---|
-| Glue ETL job (`sensor_etl`) | PySpark script: reads raw via a combined multi-date predicate, applies the DQ gate, splits clean/quarantined, writes both, self-verifies and advances its own watermark. |
-| Glue crawler — raw | Catalogs `raw` so the ETL job's `push_down_predicate` can resolve partitions. Re-run automatically at the start of every `sensor_etl` execution. |
-| Glue crawler — curated | Catalogs `curated/sensor_readings/` for Spectrum. Re-run automatically (in parallel with the quarantine crawler) at the start of every `redshift_refresh` execution. |
-| Glue crawler — curated-quarantine | Catalogs `curated/quarantine/sensor_readings/` for Spectrum. Same re-run trigger as above. |
+| Glue ETL job (`sensor_etl`) | PySpark script: reads raw via a combined multi-date predicate, applies the DQ gate, splits clean/quarantined, writes both, self-verifies and advances its own watermark. Also registers every real partition it writes, across all three curated-side tables — see [Partition registration](#curated-quarantine-and-pipeline_runs---partition-registration) below. |
+| Glue crawler — raw | Catalogs `raw` so the ETL job's `push_down_predicate` can resolve partitions. Kept for manual backfills only (uploading files directly to S3) — routine hourly data self-registers via `generate_hourly` and never triggers this crawler automatically. |
 | Lambda `missing_hours` | Computes `sensor_etl`'s missing date/hour groups, comparing its own watermark against real elapsed time. Also handles `backfill` requests. |
 | Lambda `missing_dates` | Computes `redshift_refresh`'s missing date range, cross-referencing `sensor_etl`'s watermark to avoid aggregating a day that isn't fully loaded yet. Also handles `backfill`. |
-| Lambda `generate_hourly` | Simulates one hour of device telemetry (reusing `sensor_etl.generate`'s real fleet/generation logic) and writes it directly to `raw`. |
+| Lambda `generate_hourly` | Simulates one hour of device telemetry (reusing `sensor_etl.generate`'s real fleet/generation logic), writes it to `raw`, and registers that hour's partition directly. |
 
 ### Data warehouse
 
 | Component | Role |
 |---|---|
 | Redshift Serverless (namespace + workgroup) | Hosts the 5 native KPI tables. |
-| Redshift Spectrum external schema (`curated_spectrum`) | Reads `curated`'s Parquet/JSON directly from S3 without a load step — the bridge between the data lake and the warehouse. |
+| Redshift Spectrum external schema (`curated_spectrum`) | Reads `curated`'s Parquet/JSON directly from S3 without a load step. Relies entirely on real, registered Glue Catalog partition metadata — Spectrum never reads partition-projection table properties at all, even when they're present on the table (that mechanism is Athena-only). See [`design-choices.md`](design-choices.md) for the full story. |
 | `redshift_refresh` (Redshift Data API + SQL) | `DELETE`+`INSERT` refresh of all 5 KPI tables over a date range, run as one transactional batch, verified via a real `MAX(dt)` query before advancing its own watermark. |
 
 ### Orchestration
@@ -87,6 +85,12 @@ s3://pulsegrid-dev-curated/
       dt=.../run_<job_run_id>.json   <- see below
 ```
 
+### `curated`, `quarantine`, and `pipeline_runs` — partition registration
+
+All three tables carry `projection.*` table properties (kept because they're harmless and would genuinely help if this data is ever queried through Athena directly), but Redshift Spectrum — this project's only real consumer of them — never reads those properties at all. Spectrum needs real, physically-registered partition entries in the Glue Catalog, exactly as if a crawler had created them.
+
+`etl_job.py` provides this directly. After writing `clean_df`/`quarantine_df` to S3, it computes the distinct `(dt, hour)` pairs each DataFrame actually produced — independently, since a given hour can be clean-only, quarantine-only, or both — and registers them via `glue:BatchCreatePartition` (chunked to its 100-per-call limit). `pipeline_runs`, partitioned by `dt` alone, gets one `glue:CreatePartition` call per audit record, right after its own S3 write. Registration always runs *after* the corresponding write succeeds, never before, so a registered partition can never point at data that isn't there yet. An `AlreadyExistsException` on a reprocess or backfill is expected and logged, not treated as an error.
+
 ### `curated/audit/pipeline_runs` — self-reported run records
 
 Written directly by `etl_job.py` on every successful run, one JSON file per date actually confirmed processed:
@@ -137,4 +141,4 @@ Single table, `pipeline_id` as partition key. Two items exist, one per pipeline:
 
 ## Security model
 
-Every component gets its **own** IAM role, scoped to exactly what it needs — never a shared or broad role. A few concrete examples: `generate_hourly`'s role has `s3:PutObject` on `raw` only — no read, list, or delete. `missing_dates`' role has `dynamodb:GetItem` only — it never writes. The Glue job's role has `dynamodb:UpdateItem` scoped to the one watermarks table, nothing broader. The state machine's own execution role has `sns:Publish` scoped to exactly the one failure-notification topic — nothing broader, and it's a distinct grant from the *deploy user's* own SNS permissions (topic creation, subscription management), which exist only to let Terraform provision the topic in the first place, never to publish to it. This pattern holds throughout — no component can do more than its own specific job requires.
+Every component gets its **own** IAM role, scoped to exactly what it needs — never a shared or broad role. A few concrete examples: `generate_hourly`'s role has `s3:PutObject` on `raw`, plus `glue:GetTable`/`CreatePartition` scoped to the one `raw` table — no read, list, or delete on S3, no broader Glue access. `missing_dates`' role has `dynamodb:GetItem` only — it never writes. The Glue job's role has `dynamodb:UpdateItem` scoped to the one watermarks table, plus `glue:GetTable`/`CreatePartition`/`BatchCreatePartition` scoped to exactly the three curated-side tables it registers partitions for — nothing broader. The state machine's own execution role has `sns:Publish` scoped to exactly the one failure-notification topic — nothing broader, and it's a distinct grant from the *deploy user's* own SNS permissions (topic creation, subscription management), which exist only to let Terraform provision the topic in the first place, never to publish to it. This pattern holds throughout — no component can do more than its own specific job requires.

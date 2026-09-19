@@ -34,6 +34,7 @@ Both stages (`sensor_etl` and `redshift_refresh`) are orchestrated by one combin
 - **A forward-only regression guard**, enforced entirely inside DynamoDB's own atomic `ConditionExpression` — proven live against a real out-of-order backfill.
 - **Locks claimed only when there's real work to do** — both sections check for missing data before ever touching shared state.
 - **A genuinely tested Redshift `NULL` edge case**, handled via AWS's own tagged-union response shape rather than a special-cased hack.
+- **A partition-projection incompatibility, caught by its own false-positive proof.** A fully-verified fix for Redshift Spectrum silently never worked — every test happened to query dates already registered by infrastructure that predated the change, until genuinely new data exposed the gap.
 
 Full rationale, trade-offs, and real debugging stories: [`docs/design-choices.md`](docs/design-choices.md).
 

@@ -113,7 +113,14 @@ run(
 aws s3 cp data/sample/dt=2026-06-01 s3://pulsegrid-dev-raw/dt=2026-06-01/ --recursive
 ```
 
-No manual crawl needed afterward — `StartRawCrawler` re-catalogs `raw` automatically at the start of every `sensor_etl` execution.
+**A manual crawl of `raw` is required afterward, and this step is easy to forget.** Neither `sensor_etl`'s automatic flow nor `generate_hourly` ever registers a partition it didn't itself write — a file uploaded directly to S3 like this is invisible to the Glue Catalog until something tells it otherwise:
+
+```bash
+aws glue start-crawler --name pulsegrid-dev-raw-crawler
+```
+Poll `aws glue get-crawler --name pulsegrid-dev-raw-crawler --query "Crawler.State"` until it reports `READY`, then trigger `sensor_etl`. Skipping this step produces a real, confirmed failure mode — `RunGlueJob`'s own `push_down_predicate` finds zero matching partitions for a date that genuinely has files sitting in S3, the empty-partition guard fires, and the watermark is silently left untouched, exactly as if the upload had never happened.
+
+Once `sensor_etl` actually processes the backfilled data, `curated`, `quarantine`, and `pipeline_runs` all register themselves correctly as a normal part of that run — no separate manual step needed for those three, regardless of how the underlying raw data arrived. The manual crawl above is specifically a `raw`-side requirement.
 
 ## Running the test suite
 

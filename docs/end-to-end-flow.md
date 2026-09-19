@@ -18,9 +18,11 @@ The Lambda appends this line — along with roughly 59 others, one per device in
 s3://pulsegrid-dev-raw/dt=2026-09-03/hour=13/batch_20260903T130000.jsonl
 ```
 
+Then, before it finishes, it does one more thing: it registers this exact `dt=2026-09-03/hour=13` partition directly with the Glue Catalog, via a single `glue:CreatePartition` call — so the moment this file lands in S3, it's already discoverable, with no separate cataloging step needed later.
+
 ![A real raw batch file, one JSON line per device — hvac_unit-014's row is the one this narrative follows](images/end-to-end-raw-file.png)
 
-That's it for this reading, for now. It sits in `raw`, waiting.
+That's it for this reading, for now. It sits in `raw`, registered and waiting.
 
 ## The long wait
 
@@ -30,7 +32,7 @@ Nothing touches this reading again until `00:30 UTC` the *next* day — a roughl
 
 `00:30 UTC`, September 4th. The daily EventBridge trigger fires the combined Step Functions state machine — with no `mode` specified at all, meaning both pipeline stages run, chained, in one execution.
 
-First, `sensor_etl`'s own Lambda (`missing_hours`) checks DynamoDB, discovers September 3rd is fully missing, and hands that whole day to the Glue job in one request. The raw crawler re-catalogs `raw` (picking up every hour written since the last run, including our `13:00` batch), and the Glue ETL job spins up — one Spark session, reading the entire day's worth of raw files via a single combined predicate.
+First, `sensor_etl`'s own Lambda (`missing_hours`) checks DynamoDB, discovers September 3rd is fully missing, and hands that whole day to the Glue job in one request. The Glue ETL job spins up directly — no crawl step first, since every one of September 3rd's raw partitions was already registered, hour by hour, as `generate_hourly` wrote them throughout the day. One Spark session reads the entire day's worth of raw files via a single combined predicate.
 
 Our reading passes through the quality gate cleanly: `18.88°C` and `48.73%` humidity both sit comfortably inside `hvac_unit`'s configured valid ranges, no null fields, no duplicate timestamp for this device, `status_code` a healthy `"OK"`. It's written out as a row in a Parquet file:
 
@@ -48,15 +50,15 @@ s3://pulsegrid-dev-curated/quarantine/sensor_readings/dt=2026-09-03/hour=13/part
 
 Both outcomes are real, tracked, and equally valid parts of the pipeline — quarantine isn't a failure state, it's a *deliberate, separate destination*.
 
-### The job finishes, and reports on itself
+### The job finishes, registers what it wrote, and reports on itself
 
-Once the whole day's Spark job completes, `etl_job.py` doesn't just trust that it processed what it was asked to — it queries its own output DataFrame for the actual `MAX(dt, hour)` genuinely found, and only *then* writes a self-verified watermark update to DynamoDB, guarded so it can never accidentally move backward. It also writes one audit record for September 3rd into `curated/audit/pipeline_runs/`, recording real counts: how many readings were clean, how many were quarantined, exactly which hours were covered.
+Once the whole day's Spark job completes, `etl_job.py` doesn't just trust that it processed what it was asked to — it queries its own output DataFrame for the actual `MAX(dt, hour)` genuinely found. Before touching the watermark, though, it registers every real partition the run just produced — every clean hour, every quarantined hour, each via a direct Glue Catalog call — so Redshift Spectrum can find this data later. (Spectrum, unlike Athena, never reads the partition-projection settings already sitting on these tables; it needs these real, registered entries regardless.) Only then does it write a self-verified watermark update to DynamoDB, guarded so it can never accidentally move backward, and one audit record for September 3rd into `curated/audit/pipeline_runs/`, recording real counts: how many readings were clean, how many were quarantined, exactly which hours were covered.
 
 ## The baton passes — same execution, no new trigger
 
 Because this was a `mode=full` run (or, just as often in practice, no `mode` at all — the real scheduler's actual shape), the state machine doesn't stop here. It immediately checks whether `redshift_refresh` has any new work, discovers September 3rd is now safe to aggregate (since `sensor_etl`'s watermark just confirmed the day fully closed), and continues — all within the same Step Functions execution, no separate trigger involved.
 
-Two Glue crawlers re-catalog `curated` and its quarantine folder — running in parallel, since neither depends on the other. Then, in a single transactional batch, Redshift's Data API runs `DELETE`+`INSERT` across all 5 KPI tables for September 3rd, reading directly from S3 via Spectrum — no separate data-loading step at all.
+No crawl step happens here either — `curated` and its quarantine folder were already registered, partition by partition, by the Glue job in the step before. `redshift_refresh` goes straight to work: in a single transactional batch, Redshift's Data API runs `DELETE`+`INSERT` across all 5 KPI tables for September 3rd, reading directly from S3 via Spectrum against those already-registered partitions — no separate data-loading step at all.
 
 Our `hvac_unit-014` reading, along with every other clean September 3rd reading from `FAC-02`'s HVAC units, gets aggregated into a summary row:
 

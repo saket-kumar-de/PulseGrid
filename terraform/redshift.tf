@@ -99,30 +99,3 @@ resource "aws_redshiftserverless_workgroup" "pulsegrid" {
     Project     = var.project_name
   }
 }
-
-# --- Prerequisite for daily_device_health_summary: quarantine data isn't
-# crawled yet. Separate crawler (not added to the existing curated crawler)
-# specifically to avoid a table_prefix collision -- table_prefix applies to
-# ALL of a crawler's targets, so adding this to the existing crawler would
-# rename sensor_readings/pipeline_runs too.
-
-resource "aws_glue_crawler" "curated_quarantine" {
-  name          = "${var.project_name}-${var.environment}-curated-quarantine-crawler"
-  role          = aws_iam_role.glue_role.arn
-  database_name = aws_glue_catalog_database.curated.name
-  table_prefix  = "quarantine_"
-
-  s3_target {
-    path = "s3://${aws_s3_bucket.curated.bucket}/quarantine/sensor_readings/"
-  }
-
-  schema_change_policy {
-    delete_behavior = "LOG"
-    update_behavior = "UPDATE_IN_DATABASE"
-  }
-
-  tags = {
-    Environment = var.environment
-    Project     = var.project_name
-  }
-}

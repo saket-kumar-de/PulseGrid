@@ -29,9 +29,6 @@ output "sensor_etl_job_name" {
 output "curated_glue_database" {
   value = aws_glue_catalog_database.curated.name
 }
-output "curated_crawler_name" {
-  value = aws_glue_crawler.curated.name
-}
 output "athena_workgroup_name" {
   value = aws_athena_workgroup.pulsegrid.name
 }

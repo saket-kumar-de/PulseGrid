@@ -2,7 +2,7 @@
 
 The complete, state-by-state orchestration logic — every real state in `state_machines/sensor_etl.asl.json`, exactly as it exists in the deployed state machine. For the underlying data flow and component roles, see [`architecture.md`](architecture.md); for *why* things are built this way, see [`design-choices.md`](design-choices.md).
 
-33 top-level states in total (40 including the `Parallel` state's own internal branches).
+28 states in total — no `Parallel` state remains in this definition, so this is also the complete count including branches.
 
 ## The `mode` parameter
 
@@ -59,6 +59,8 @@ graph TD
 
 ## `sensor_etl` section — full detail
 
+Neither section calls a crawler as part of its automatic flow. `sensor_etl`'s own raw crawler resource still exists, but only for manual backfills done by uploading files directly to S3 — routine hourly data self-registers its own partition via `generate_hourly`, and `ClaimLock` here routes straight to `RunGlueJob`, never touching the crawler at all.
+
 ```mermaid
 graph TD
     GMH[GetMissingHours] --> CIM{CheckIfAnyMissing}
@@ -66,18 +68,11 @@ graph TD
     CIM -->|missing_groups empty| AC([AllCaughtUp])
     CIM -->|missing_groups0 present| CL[ClaimLock]
     CL -->|ConditionalCheckFailedException| AR([AlreadyRunning])
-    CL --> SRC[StartRawCrawler]
-    SRC --> WFC[WaitForCrawler: 20s]
-    WFC --> GCS[GetCrawlerStatus]
-    GCS --> CCS{CheckCrawlerStatus}
-    CCS -->|not READY| WFC
-    CCS -->|READY| RGJ[RunGlueJob<br/>--date_groups]
+    CL --> RGJ[RunGlueJob<br/>--date_groups]
     RGJ --> RLS[ReleaseLockOnSuccess]
     RLS --> MC2OUT([-> ModeCheck2])
 
-    SRC -.any failure.-> RLF[ReleaseLockOnFailure]
-    GCS -.any failure.-> RLF
-    RGJ -.any failure.-> RLF
+    RGJ -.any failure.-> RLF[ReleaseLockOnFailure]
     RLF --> CSF{CheckIfScheduledFailure}
     CSF -->|triggered_by=schedule| PFN[PublishFailureNotification]
     CSF -->|absent, or any other value| FAIL([Fail])
@@ -85,13 +80,12 @@ graph TD
 ```
 
 ![A real mode=glue_only execution, fully successful end to end](images/architecture-flow-glue-section.png)
-*A real `mode=glue_only` execution — confirmed via the execution's own recorded input, not inferred from the graph.*
 
 Notes on specific states:
 - **`GetMissingHours`'s own failure** routes to `CheckIfScheduledFailure` directly, never through `ReleaseLockOnFailure` — at that point in the flow, no lock has been claimed yet, so there's nothing to release. This is the same principle behind claiming the lock only once real work is confirmed, applied consistently to failure handling too.
 - **`ClaimLock`'s catch is deliberately narrow** — only `DynamoDB.ConditionalCheckFailedException`, not `States.ALL` like every other catch in this section. A genuine lock conflict routes to `AlreadyRunning`; any other failure at this state propagates unhandled, since a failed claim means nothing was ever actually acquired to release.
 - **`RunGlueJob`** carries its own `Retry` for `Glue.ConcurrentRunsExceededException` (3 attempts, 60s interval, 2.0 backoff) — a real, tested resilience mechanism for the case where a previous execution's Glue job is still finishing as a new one starts.
-- **`RunGlueJob`** passes the *whole* `missing_groups` array as one `--date_groups` argument — one Spark session handles every date in the batch, not one job run per date.
+- **`RunGlueJob`** passes the *whole* `missing_groups` array as one `--date_groups` argument — one Spark session handles every date in the batch, not one job run per date. It's also now the state directly responsible for registering every partition it writes — see [`architecture.md`](architecture.md#curated-quarantine-and-pipeline_runs---partition-registration) and [`design-choices.md`](design-choices.md) for the full story of why.
 - **`CheckIfScheduledFailure`** is a single, shared gate — reached from both this section's failures *and* `redshift_refresh`'s (below).
 
 ## `redshift_refresh` section — full detail
@@ -103,23 +97,7 @@ graph TD
     CIDM -->|no start_date| RAC([RedshiftAllCaughtUp])
     CIDM -->|start_date present| CRL[ClaimRedshiftLock]
     CRL -->|ConditionalCheckFailedException| RAR([RedshiftAlreadyRunning])
-
-    CRL --> SCC[StartCuratedCrawler]
-    SCC --> WFCC[WaitForCuratedCrawler: 20s]
-    WFCC --> GCCS[GetCuratedCrawlerStatus]
-    GCCS --> CCCS{CheckCuratedCrawlerStatus}
-    CCCS -->|not READY| WFCC
-    CCCS -->|READY| CCD([CuratedCrawlDone])
-
-    CRL --> SQC[StartQuarantineCrawler]
-    SQC --> WFQC[WaitForQuarantineCrawler: 20s]
-    WFQC --> GQCS[GetQuarantineCrawlerStatus]
-    GQCS --> CQCS{CheckQuarantineCrawlerStatus}
-    CQCS -->|not READY| WFQC
-    CQCS -->|READY| QCD([QuarantineCrawlDone])
-
-    CCD --> RRR[RunRedshiftRefresh<br/>BatchExecuteStatement, 11 SQL statements]
-    QCD --> RRR
+    CRL --> RRR[RunRedshiftRefresh<br/>BatchExecuteStatement, 11 SQL statements]
 
     RRR --> WFRS[WaitForRedshiftStatement: 15s]
     WFRS --> DRS[DescribeRedshiftStatement]
@@ -133,8 +111,6 @@ graph TD
     ARW -->|advanced OR blocked by guard| RRLS
     RRLS --> DONEOUT([-> ExecutionComplete])
 
-    SCC -.any failure.-> RRLF
-    SQC -.any failure.-> RRLF
     RRR -.any failure.-> RRLF
     DRS -.any failure.-> RRLF
     RRLF --> CSF2{CheckIfScheduledFailure}
@@ -144,19 +120,19 @@ graph TD
 ```
 
 ![A real mode=redshift_only execution, fully successful end to end, including a genuine watermark advance](images/architecture-flow-redshift-section.png)
-*A real `mode=redshift_only` execution, including a genuine `AdvanceRedshiftWatermark` run — confirmed via the execution's own recorded input.*
 
 Notes on specific states:
-- **`CrawlCuratedSchemas`** is this project's only `Parallel` state, shown here fully expanded — both crawlers run concurrently, not sequentially, since they target independent S3 prefixes with no data dependency between them. `RunRedshiftRefresh` only proceeds once *both* branches have completed.
+- **`ClaimRedshiftLock` routes straight to `RunRedshiftRefresh`** — no crawler step at all. `curated`, `quarantine_sensor_readings`, and `pipeline_runs` are all now partition-registered directly by `etl_job.py`, not discovered by a crawler that ran here. This project's only `Parallel` state (the curated + quarantine crawler pair) has been removed entirely — see [`design-choices.md`](design-choices.md) for why crawling was needed in the first place, and why it was replaced with direct registration rather than partition projection.
+- **`GetMissingDates`' `ResultSelector` deliberately defers extraction**, carrying the whole `Payload` object forward (`"Payload.$": "$.Payload"`) instead of immediately pulling out `start_date`/`end_date`. This was a real bug fix: `missing_dates`' own "nothing to do" case returns a genuinely empty `{}`, and extracting fields immediately crashed with an uncatchable `States.Runtime` error the first time this ran live against a truly empty response. `CheckIfAnyDatesMissing` and `RunRedshiftRefresh` both read from the resulting `$.redshiftResult.Payload.*` path, one level deeper than before, for the same reason.
 - **`RunRedshiftRefresh`** submits 11 statements in one `TRANSACTION`-mode batch: 5 `DELETE`+`INSERT` pairs for the KPI tables, plus an 11th, read-only `SELECT MAX(dt)` — the mechanism the next two states use to verify what was *actually* found, not what was requested.
 - **`GetRedshiftMaxDate`** reads the 11th statement's own sub-result via `SubStatements[10].Id` — `BatchExecuteStatement`'s parent ID can't retrieve results directly; each statement in the batch gets its own sub-statement ID.
 - **`CheckRedshiftMaxDateFound`** exists because `MAX(dt)` over zero matched rows returns SQL `NULL`, represented as `{"IsNull": true}` rather than an empty `StringValue` — checking for the key's presence correctly distinguishes a real date from this case.
 - **`AdvanceRedshiftWatermark`**'s `Catch` deliberately routes to `ReleaseRedshiftLockOnSuccess`, not `...OnFailure` — a regression-guard block (`ConditionalCheckFailedException`) is expected, correct behavior, never treated as a pipeline failure.
 - **`CheckIfScheduledFailure`/`PublishFailureNotification`** here (labeled `CSF2`/`PFN2` in the diagram above purely to avoid a naming clash within this one Mermaid code block) are the **same shared states** shown in the `sensor_etl` section's diagram — not a second copy. Both sections' failures converge on one gate.
 
-## Poll-loop pattern, used three times
+## Poll-loop pattern
 
-The raw crawler, each of the two crawlers inside `CrawlCuratedSchemas`, and the Redshift statement check all use the identical shape: `Wait` → check status → `Choice` routing back to the same `Wait` state if not yet done. The Redshift version adds explicit `FAILED`/`ABORTED` branches — without them, a genuinely failed statement would loop on `Wait` forever, since only checking for the success status and treating everything else as "still running" doesn't account for terminal failure states.
+Only one remains in this definition: the Redshift statement check (`WaitForRedshiftStatement` → `DescribeRedshiftStatement` → `CheckRedshiftStatementStatus`, routing back to the same `Wait` state if not yet done). It adds explicit `FAILED`/`ABORTED` branches — without them, a genuinely failed statement would loop on `Wait` forever, since only checking for the success status and treating everything else as "still running" doesn't account for terminal failure states. Two other, near-identical poll loops (the raw crawler, and each of the curated/quarantine crawlers) existed earlier in this project but have since been removed along with the crawlers themselves.
 
 ## Failure notifications
 
